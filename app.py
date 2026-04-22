@@ -81,7 +81,7 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
 
 def merge_and_deduplicate(dfs: dict, mapping: dict) -> tuple:
     """
-    Aplica el mapeo a TODOS los archivos, los concatena y deduplica por DOC_DNI_RUC.
+    Aplica el mapeo a TODOS los archivos, los concatena y deduplica por COD_CREDITO.
     Cuando hay duplicados, prevalece el registro con FEC_ULT_PAGO_ACTUAL más reciente.
     Retorna (df_resultado, n_duplicados_eliminados, detalle_duplicados).
     """
@@ -100,20 +100,20 @@ def merge_and_deduplicate(dfs: dict, mapping: dict) -> tuple:
         dayfirst=True, errors="coerce"
     )
 
-    # Registros sin DOC_DNI_RUC no se deduplicarán (se conservan todos)
-    empty_mask = combined["DOC_DNI_RUC"].astype(str).str.strip().eq("")
-    df_sin_dni = combined[empty_mask].copy()
-    df_con_dni = combined[~empty_mask].copy()
+    # Registros sin COD_CREDITO no se deduplicarán (se conservan todos)
+    empty_mask  = combined["COD_CREDITO"].astype(str).str.strip().eq("")
+    df_sin_cod  = combined[empty_mask].copy()
+    df_con_cod  = combined[~empty_mask].copy()
 
     # Detectar duplicados antes de eliminar (para el reporte)
-    dup_mask   = df_con_dni.duplicated(subset=["DOC_DNI_RUC"], keep=False)
-    duplicados = df_con_dni[dup_mask].copy()
+    dup_mask   = df_con_cod.duplicated(subset=["COD_CREDITO"], keep=False)
+    duplicados = df_con_cod[dup_mask].copy()
 
     # Ordenar: fecha más reciente primero; NaT al final
-    df_con_dni = df_con_dni.sort_values("_fecha_ord", ascending=False, na_position="last")
-    df_dedup   = df_con_dni.drop_duplicates(subset=["DOC_DNI_RUC"], keep="first")
+    df_con_cod = df_con_cod.sort_values("_fecha_ord", ascending=False, na_position="last")
+    df_dedup   = df_con_cod.drop_duplicates(subset=["COD_CREDITO"], keep="first")
 
-    result = pd.concat([df_dedup, df_sin_dni], ignore_index=True)
+    result = pd.concat([df_dedup, df_sin_cod], ignore_index=True)
     n_removed = n_total - len(result)
 
     # Limpiar columnas auxiliares
@@ -392,7 +392,7 @@ def main():
             st.divider()
             st.subheader(f"🔀 Combinar {len(st.session_state.dfs)} archivos con deduplicación")
             st.caption(
-                "Une todos los archivos en uno solo. Si el mismo **DOC_DNI_RUC** aparece "
+                "Une todos los archivos en uno solo. Si el mismo **COD_CREDITO** (número de cuenta) aparece "
                 "en más de un archivo, prevalece el registro con **FEC_ULT_PAGO_ACTUAL** más reciente."
             )
 
@@ -414,21 +414,21 @@ def main():
                     expanded=False,
                 ):
                     st.caption(
-                        "Se muestra el grupo completo de cada DNI duplicado. "
+                        "Se muestra el grupo completo de cada número de cuenta duplicado. "
                         "La fila con la fecha más reciente fue la que se conservó."
                     )
-                    show_cols = ["_source_file", "DOC_DNI_RUC", "NOM_CLI",
+                    show_cols = ["_source_file", "COD_CREDITO", "DOC_DNI_RUC", "NOM_CLI",
                                  "FEC_ULT_PAGO_ACTUAL", "DEUDA_TOTAL"]
                     show_cols = [c for c in show_cols if c in duplicados_df.columns]
                     st.dataframe(
                         duplicados_df[show_cols]
-                        .sort_values(["DOC_DNI_RUC", "FEC_ULT_PAGO_ACTUAL"])
+                        .sort_values(["COD_CREDITO", "FEC_ULT_PAGO_ACTUAL"])
                         .reset_index(drop=True),
                         use_container_width=True,
                         height=300,
                     )
             else:
-                st.success("✅ No se encontraron DOC_DNI_RUC duplicados entre los archivos.")
+                st.success("✅ No se encontraron COD_CREDITO duplicados entre los archivos.")
 
             merged_alerts = get_alerts(merged)
             if merged_alerts:
