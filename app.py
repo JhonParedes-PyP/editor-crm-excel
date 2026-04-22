@@ -79,6 +79,50 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
     return buf.getvalue()
 
 
+def merge_and_deduplicate(dfs: dict, mapping: dict) -> tuple:
+    """
+    Aplica el mapeo a TODOS los archivos, los concatena y deduplica por DOC_DNI_RUC.
+    Cuando hay duplicados, prevalece el registro con FEC_ULT_PAGO_ACTUAL más reciente.
+    Retorna (df_resultado, n_duplicados_eliminados, detalle_duplicados).
+    """
+    frames = []
+    for fname, df in dfs.items():
+        transformed = apply_mapping(df, mapping)
+        transformed["_source_file"] = fname
+        frames.append(transformed)
+
+    combined = pd.concat(frames, ignore_index=True)
+    n_total = len(combined)
+
+    # Parsear FEC_ULT_PAGO_ACTUAL con varios formatos posibles
+    combined["_fecha_ord"] = pd.to_datetime(
+        combined["FEC_ULT_PAGO_ACTUAL"].astype(str).str.strip(),
+        dayfirst=True, errors="coerce"
+    )
+
+    # Registros sin DOC_DNI_RUC no se deduplicarán (se conservan todos)
+    empty_mask = combined["DOC_DNI_RUC"].astype(str).str.strip().eq("")
+    df_sin_dni = combined[empty_mask].copy()
+    df_con_dni = combined[~empty_mask].copy()
+
+    # Detectar duplicados antes de eliminar (para el reporte)
+    dup_mask   = df_con_dni.duplicated(subset=["DOC_DNI_RUC"], keep=False)
+    duplicados = df_con_dni[dup_mask].copy()
+
+    # Ordenar: fecha más reciente primero; NaT al final
+    df_con_dni = df_con_dni.sort_values("_fecha_ord", ascending=False, na_position="last")
+    df_dedup   = df_con_dni.drop_duplicates(subset=["DOC_DNI_RUC"], keep="first")
+
+    result = pd.concat([df_dedup, df_sin_dni], ignore_index=True)
+    n_removed = n_total - len(result)
+
+    # Limpiar columnas auxiliares
+    result     = result.drop(columns=["_fecha_ord", "_source_file"])
+    duplicados = duplicados.drop(columns=["_fecha_ord"])
+
+    return result, n_removed, duplicados
+
+
 def get_alerts(df: pd.DataFrame) -> list:
     """Valida DOC_DNI_RUC vacío y montos no numéricos. Retorna lista de (nivel, mensaje)."""
     alerts = []
@@ -343,11 +387,66 @@ def main():
             type="primary",
         )
 
-        # ── Exportar todos los archivos como ZIP ──────────────────────────────
+        # ── Combinar y deduplicar (solo si hay más de 1 archivo) ─────────────
         if len(st.session_state.dfs) > 1:
             st.divider()
-            st.subheader(f"Exportar todos los archivos ({len(st.session_state.dfs)})")
-            st.caption("Se aplica el mismo mapeo actual a todos los archivos cargados.")
+            st.subheader(f"🔀 Combinar {len(st.session_state.dfs)} archivos con deduplicación")
+            st.caption(
+                "Une todos los archivos en uno solo. Si el mismo **DOC_DNI_RUC** aparece "
+                "en más de un archivo, prevalece el registro con **FEC_ULT_PAGO_ACTUAL** más reciente."
+            )
+
+            merged, n_removed, duplicados_df = merge_and_deduplicate(
+                st.session_state.dfs, st.session_state.mapping
+            )
+
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Registros totales (antes)",
+                      f"{sum(len(d) for d in st.session_state.dfs.values()):,}")
+            m2.metric("Duplicados eliminados",     f"{n_removed:,}",
+                      delta=f"-{n_removed}" if n_removed else None,
+                      delta_color="inverse" if n_removed else "off")
+            m3.metric("Registros finales",         f"{len(merged):,}")
+
+            if n_removed:
+                with st.expander(
+                    f"🔍 Ver los {n_removed} registro(s) duplicado(s) que fueron reemplazados",
+                    expanded=False,
+                ):
+                    st.caption(
+                        "Se muestra el grupo completo de cada DNI duplicado. "
+                        "La fila con la fecha más reciente fue la que se conservó."
+                    )
+                    show_cols = ["_source_file", "DOC_DNI_RUC", "NOM_CLI",
+                                 "FEC_ULT_PAGO_ACTUAL", "DEUDA_TOTAL"]
+                    show_cols = [c for c in show_cols if c in duplicados_df.columns]
+                    st.dataframe(
+                        duplicados_df[show_cols]
+                        .sort_values(["DOC_DNI_RUC", "FEC_ULT_PAGO_ACTUAL"])
+                        .reset_index(drop=True),
+                        use_container_width=True,
+                        height=300,
+                    )
+            else:
+                st.success("✅ No se encontraron DOC_DNI_RUC duplicados entre los archivos.")
+
+            merged_alerts = get_alerts(merged)
+            if merged_alerts:
+                for lvl, msg in merged_alerts:
+                    icon = "⚠️" if lvl == "warning" else "🚨"
+                    (st.warning if lvl == "warning" else st.error)(f"{icon} {msg}")
+
+            st.download_button(
+                label="🔀 Descargar Excel Combinado (deduplicado)",
+                data=to_excel_bytes(merged),
+                file_name="combinado_CRM.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+
+            st.divider()
+            st.subheader(f"📦 Exportar archivos por separado ({len(st.session_state.dfs)})")
+            st.caption("Cada archivo se convierte individualmente con el mapeo actual.")
 
             zip_buf = BytesIO()
             with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -359,7 +458,7 @@ def main():
                     )
 
             st.download_button(
-                label="📦 Descargar todos como ZIP",
+                label="📦 Descargar todos por separado como ZIP",
                 data=zip_buf.getvalue(),
                 file_name="exportacion_CRM.zip",
                 mime="application/zip",
