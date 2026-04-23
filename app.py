@@ -1,6 +1,4 @@
-#!/usr/bin/env python3
-"""
-Editor de Excel → CRM
+
 Convierte archivos .xlsx a las 26 columnas estándar del CRM con mapeo configurable.
 """
 
@@ -12,64 +10,81 @@ from io import BytesIO
 import pandas as pd
 import streamlit as st
 
-# ─── Columnas destino del CRM (orden fijo) ────────────────────────────────────
-CRM_COLUMNS = [
-    "DOC_DNI_RUC",       "NOM_CLI",           "CARTERA",           "COD_CREDITO",
-    "NOM_AGENCIA",       "DEUDA_CAP",         "DEUDA_TOTAL",       "TLF_CELULAR_CLIENTE",
-    "DIR_CASA",          "DISTRITO",          "RANGO_DIAS_MORA",   "FEC_ULT_PAGO_ACTUAL",
-    "NOM_CONYUGE",       "NOM_AVAL",          "TLF_CELULAR_AVAL",  "NOM_CONYUGE_AVAL",
-    "DIR_CASA_AVAL",     "DISTRITO_AVAL",     "EXPEDIENTE",        "JUZGADO",
-    "CONDICION",         "REFERENCIA",        "PROCESO_JUDICIAL",  "FEC_DEMANDA",
-    "MONTO_DEMANDA",     "FEC_INGRESO_JUDICIAL",
-]
-
-NUMERIC_COLS = {"DEUDA_CAP", "DEUDA_TOTAL", "MONTO_DEMANDA"}
-PROFILES_FILE = "mapping_profiles.json"
-NONE_LABEL    = "— sin mapeo —"
+from config import CRM_COLUMNS, NUMERIC_COLS, NONE_LABEL, PROFILES_FILE
+from utils import load_profiles, save_profiles, auto_map, is_non_numeric, apply_mapping, get_alerts
 
 
-# ─── Utilidades de datos ───────────────────────────────────────────────────────
-
-def load_profiles() -> dict:
-    if os.path.exists(PROFILES_FILE):
-        try:
-            with open(PROFILES_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError):
-            return {}
-    return {}
 
 
-def save_profiles(profiles: dict) -> None:
-    with open(PROFILES_FILE, "w", encoding="utf-8") as f:
-        json.dump(profiles, f, ensure_ascii=False, indent=2)
+# ─── Utilidades restantes ───────────────────────────────────────────────────────
+
+def to_excel_bytes(df: pd.DataFrame) -> bytes:
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="CRM")
+    return buf.getvalue()
 
 
-def auto_map(source_cols: list) -> dict:
-    """Mapeo automático por nombre idéntico (insensible a mayúsculas/espacios)."""
-    lookup = {c.upper().strip(): c for c in source_cols}
-    return {crm: lookup[crm] for crm in CRM_COLUMNS if crm in lookup}
+def merge_and_deduplicate(dfs: dict, mapping: dict) -> tuple:
+    """
+    Aplica el mapeo a TODOS los archivos, los concatena y deduplica por COD_CREDITO.
+    Cuando hay duplicados, prevalece el registro con FEC_ULT_PAGO_ACTUAL más reciente.
+    Retorna (df_resultado, n_duplicados_eliminados, detalle_duplicados).
+    """
+    frames = []
+    for fname, df in dfs.items():
+        transformed = apply_mapping(df, mapping)
+        transformed["_source_file"] = fname
+        frames.append(transformed)
+
+    combined = pd.concat(frames, ignore_index=True)
+    n_total = len(combined)
+
+    # Parsear FEC_ULT_PAGO_ACTUAL con varios formatos posibles
+    combined["_fecha_ord"] = pd.to_datetime(
+        combined["FEC_ULT_PAGO_ACTUAL"].astype(str).str.strip(),
+        dayfirst=True, errors="coerce"
+    )
+
+    # Registros sin COD_CREDITO no se deduplicarán (se conservan todos)
+    empty_mask  = combined["COD_CREDITO"].astype(str).str.strip().eq("")
+    df_sin_cod  = combined[empty_mask].copy()
+    df_con_cod  = combined[~empty_mask].copy()
+
+    # Detectar duplicados antes de eliminar (para el reporte)
+    dup_mask   = df_con_cod.duplicated(subset=["COD_CREDITO"], keep=False)
+    duplicados = df_con_cod[dup_mask].copy()
+
+    # Ordenar: fecha más reciente primero; NaT al final
+    df_con_cod = df_con_cod.sort_values("_fecha_ord", ascending=False, na_position="last")
+    df_dedup   = df_con_cod.drop_duplicates(subset=["COD_CREDITO"], keep="first")
+
+    result = pd.concat([df_dedup, df_sin_cod], ignore_index=True)
+    n_removed = n_total - len(result)
+
+    # Limpiar columnas auxiliares
+    result     = result.drop(columns=["_fecha_ord", "_source_file"])
+    duplicados = duplicados.drop(columns=["_fecha_ord"])
+
+    return result, n_removed, duplicados
 
 
-def is_non_numeric(val) -> bool:
-    """True si el valor no puede convertirse a número."""
-    if pd.isna(val) or str(val).strip() in ("", "nan", "None"):
-        return False
-    try:
-        float(str(val).replace(",", ".").replace(" ", ""))
-        return False
-    except ValueError:
-        return True
+def get_alerts(df: pd.DataFrame) -> list:
+    """Valida DOC_DNI_RUC vacío y montos no numéricos. Retorna lista de (nivel, mensaje)."""
+    alerts = []
 
+    empty_mask = df["DOC_DNI_RUC"].isna() | df["DOC_DNI_RUC"].astype(str).str.strip().eq("")
+    n_empty = int(empty_mask.sum())
+    if n_empty:
+        alerts.append(("warning", f"**DOC_DNI_RUC**: {n_empty} registro(s) vacíos"))
 
-def apply_mapping(df: pd.DataFrame, mapping: dict) -> pd.DataFrame:
-    """Retorna un DataFrame con exactamente las 26 columnas CRM en orden fijo."""
-    n = len(df)
-    data = {}
-    for col in CRM_COLUMNS:
-        src = mapping.get(col, "")
-        data[col] = df[src].tolist() if src and src in df.columns else [""] * n
-    return pd.DataFrame(data)
+    for col in NUMERIC_COLS:
+        bad = df[col].apply(is_non_numeric)
+        if bad.any():
+            examples = df.loc[bad, col].astype(str).unique()[:3].tolist()
+            alerts.append(("error", f"**{col}**: valores no numéricos detectados → {examples}"))
+
+    return alerts
 
 
 def to_excel_bytes(df: pd.DataFrame) -> bytes:
@@ -174,26 +189,34 @@ def main():
         st.header("📁 Archivos Excel")
 
         uploaded = st.file_uploader(
-            "Sube uno o más archivos .xlsx",
+            "Sube uno o más archivos .xlsx (multi-hoja soportado)",
             type=["xlsx"],
             accept_multiple_files=True,
-            help="Se leerá la primera hoja de cada archivo",
         )
+
+        if "file_sheets" not in st.session_state:
+            st.session_state.file_sheets = {}
 
         if uploaded:
             current_names = {f.name for f in uploaded}
-            # Quitar archivos que el usuario removió del uploader
-            st.session_state.dfs = {k: v for k, v in st.session_state.dfs.items()
-                                     if k in current_names}
-            # Leer archivos nuevos
+            # Limpiar DFs y sheets removidos
+            st.session_state.dfs = {k: v for k, v in st.session_state.dfs.items() if k in current_names}
+            st.session_state.file_sheets = {k: v for k, v in st.session_state.file_sheets.items() if k in current_names}
+            
             for uf in uploaded:
                 if uf.name not in st.session_state.dfs:
-                    with st.spinner(f"Leyendo {uf.name}…"):
-                        try:
-                            df_read = pd.read_excel(uf, sheet_name=0, dtype=str).fillna("")
-                            st.session_state.dfs[uf.name] = df_read
-                        except Exception as e:
-                            st.error(f"❌ {uf.name}: {e}")
+                    try:
+                        xl = pd.ExcelFile(uf)
+                        sheets = xl.sheet_names
+                        st.session_state.file_sheets[uf.name] = sheets
+                        
+                        # Por defecto primera hoja
+                        df_read = pd.read_excel(uf, sheet_name=sheets[0], dtype=str).fillna("")
+                        st.session_state.dfs[uf.name] = df_read
+                        st.success(f"✅ **{uf.name}** — {len(df_read):,} filas ({len(sheets)} hojas)")
+                    except Exception as e:
+                        st.error(f"❌ {uf.name}: {e}")
+
 
             for name, df_s in sorted(st.session_state.dfs.items()):
                 st.success(f"✅ **{name}** — {len(df_s):,} filas")
@@ -256,13 +279,24 @@ def main():
 
     # Selector de archivo activo
     file_names = sorted(st.session_state.dfs.keys())
-    if len(file_names) > 1:
-        active_file = st.selectbox("📄 Archivo activo:", file_names)
+    if file_names:
+        active_file = st.selectbox("📄 Archivo activo:", file_names, key="active_file")
+        sheets = st.session_state.file_sheets.get(active_file, [])
+        if sheets:
+            sheet_name = st.selectbox("📄 Hoja:", sheets, key="active_sheet")
+            active_df_key = (active_file, sheet_name)
+            
+            if active_df_key not in st.session_state:
+                df_read = pd.read_excel(st.session_state.file_sheets[active_file], sheet_name=sheet_name, dtype=str).fillna("")
+                st.session_state[active_df_key] = df_read
+            
+            active_df = st.session_state[active_df_key]
+            st.info(f"📄 **{active_file}** — Hoja: **{sheet_name}** — {len(active_df):,} filas")
+        else:
+            active_df = st.session_state.dfs[active_file]
     else:
-        active_file = file_names[0]
-        st.info(f"📄 Archivo cargado: **{active_file}**")
+        active_df = pd.DataFrame()
 
-    active_df = st.session_state.dfs[active_file]
     src_cols  = list(active_df.columns)
     options   = [NONE_LABEL] + src_cols
 
@@ -271,8 +305,9 @@ def main():
         st.session_state.mapping = auto_map(src_cols)
 
     # ── Tabs ─────────────────────────────────────────────────────────────────────
-    tab_map, tab_prev, tab_dl = st.tabs([
+    tab_map, tab_stats, tab_prev, tab_dl = st.tabs([
         "🔗  Mapeo de Columnas",
+        "📈 Stats & Filtros",
         "👁️  Vista Previa",
         "⬇️  Descargar",
     ])
@@ -331,26 +366,50 @@ def main():
     # TAB 2 · Vista previa
     # ══════════════════════════════════════════════════════════════════════════
     with tab_prev:
-        st.subheader("Vista Previa — primeros 20 registros transformados")
-        preview = apply_mapping(active_df.head(20), st.session_state.mapping)
+        st.subheader("👁️  Vista Previa y Edición")
+        
+        if len(active_df) > 0:
+            preview_full = apply_mapping(active_df.head(100), st.session_state.mapping)  # Más filas para edición
+            alerts = get_alerts(preview_full)
+            if alerts:
+                for lvl, msg in alerts:
+                    icon = "⚠️" if lvl == "warning" else "🚨"
+                    (st.warning if lvl == "warning" else st.error)(f"{icon} {msg}")
+            else:
+                st.success("✅ Sin alertas en preview")
 
-        alerts = get_alerts(preview)
-        if alerts:
-            for lvl, msg in alerts:
-                icon = "⚠️" if lvl == "warning" else "🚨"
-                (st.warning if lvl == "warning" else st.error)(f"{icon} {msg}")
+            # Edición inline con streamlit-aggrid
+            try:
+                from st_aggrid import GridOptionsBuilder, AgGrid, GridUpdateMode
+                gb = GridOptionsBuilder.from_dataframe(preview_full)
+                gb.configure_default_column(minWidth=120, autoHeight=True)
+                gb.configure_column("DOC_DNI_RUC", cellStyle={"backgroundColor": "rgba(255,228,228,0.5)"} if any(preview_full["DOC_DNI_RUC"].str.strip()=="") else None)
+                gridOptions = gb.build()
+                
+                grid_response = AgGrid(
+                    preview_full,
+                    gridOptions=gridOptions,
+                    height=400,
+                    update_mode=GridUpdateMode.SELECTION_CHANGED,
+                    fit_columns_on_grid_load=True
+                )
+                
+                if grid_response['selected_rows']:
+                    st.session_state.edited_preview = pd.DataFrame(grid_response['selected_rows'])
+                    st.success("✅ Cambios editados guardados en session")
+            except ImportError:
+                # Fallback si aggrid no instalado
+                def _hl(val):
+                    return "background-color:#ffe4e4;color:#cc0000;" if str(val).strip() == "" else ""
+                st.data_editor(
+                    preview_full.head(20).style.map(_hl, subset=["DOC_DNI_RUC"]),
+                    use_container_width=True,
+                    num_rows="dynamic",
+                    key="edited_preview_fallback"
+                )
         else:
-            st.success("✅ Sin alertas en los primeros 20 registros")
+            st.warning("Carga un archivo para ver preview")
 
-        # Resaltar celdas vacías de DOC_DNI_RUC en rojo
-        def _hl(val):
-            return "background-color:#ffe4e4;color:#cc0000;" if str(val).strip() == "" else ""
-
-        st.dataframe(
-            preview.style.map(_hl, subset=["DOC_DNI_RUC"]),
-            use_container_width=True,
-            height=460,
-        )
 
     # ══════════════════════════════════════════════════════════════════════════
     # TAB 3 · Descarga
